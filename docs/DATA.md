@@ -17,14 +17,21 @@ What this means for the project:
 - **No redistribution of raw data in git.** `data/raw/` and `data/processed/` are
   git-ignored, and `data/prepare.py` regenerates `processed/` from the raw downloads.
 - **Attribution.** Cite both papers in the README and the model card.
+- **Upstream sources.** BIRD's databases were built from public sources (for example Kaggle
+  datasets), which may have terms of their own. Review these before publishing anything
+  that redistributes database contents, such as the example rows inside the prompts.
 
 ## Download (manual)
 
 The build environment cannot reach the dataset hosts, so you download and unpack these
 yourself. Paths are relative to `sql-finetune/`.
 
+Requirements: Python 3.11 or newer, and the `text2sql` repo cloned next to this one
+(`../text2sql`), because `requirements-data.txt` installs `t2s_eval` from there.
+
 1. **Spider.** From https://yale-lily.github.io/spider, download the Spider dataset zip and
-   unpack it so these paths exist:
+   unpack it so these paths exist. Newer zips unpack to a `spider_data/` folder; rename it
+   to `spider`.
    - `data/raw/spider/train_spider.json`
    - `data/raw/spider/train_others.json`
    - `data/raw/spider/dev.json`
@@ -38,7 +45,9 @@ yourself. Paths are relative to `sql-finetune/`.
    - `data/raw/bird/dev/dev.json`
    - `data/raw/bird/dev/dev_databases/<db_id>/<db_id>.sqlite`
 
-   If your dev folder has a dated name such as `dev_20240627`, rename it to `dev`.
+   If your dev folder has a dated name such as `dev_20240627`, rename it to `dev`. The
+   dev databases must be unpacked too, even though they are only used for checking. The
+   leakage checks compare schemas, so the run stops if any eval database file is missing.
 3. Run the pipeline:
    ```bash
    python -m venv .venv && source .venv/bin/activate
@@ -51,30 +60,53 @@ yourself. Paths are relative to `sql-finetune/`.
 ## Pipeline (`data/prepare.py`)
 
 1. **Load** each train file with `t2s_eval.load_examples`, the same loader the evaluator uses.
-2. **Clean.** Collapse whitespace in questions, evidence and SQL, and strip trailing `;`.
-   Drop empty rows.
-3. **Check labels.** Execute every gold SQL query read-only with `t2s_eval.execute_sql` and
-   drop any that fail or time out (30 s by default). Training on broken labels teaches broken
+2. **Clean.**
+   - Collapse whitespace in questions and evidence.
+   - In SQL, collapse whitespace *outside* quotes only, so string literals and quoted
+     identifiers stay exactly as written. Strip any trailing `;`.
+   - Drop empty rows.
+3. **Check labels.** Execute every gold SQL query read-only with `t2s_eval.execute_sql`.
+   Drop any that fail (`gold_sql_error`), time out after 30 s by default (`gold_timeout`),
+   or return more than 100,000 rows (`gold_too_many_rows`). Training on broken labels teaches broken
    SQL. You can turn this step off with `--skip-exec`.
 4. **Remove duplicates**, within each source and database:
    - An exact duplicate (same question, evidence and SQL) is dropped.
    - When the same question has two different SQL labels, only the first is kept and the
      rest are dropped as `conflicting_duplicate`.
-5. **Remove eval overlap.** A training example is dropped if:
-   - its database is an eval database, matched by the same source and `db_id`
-     (`leak_eval_db`);
-   - its database has the same table and column names as any eval database, under any name
-     (`leak_eval_schema`), which catches renamed copies;
-   - its normalized question equals any Spider dev/test or BIRD dev question
-     (`leak_eval_question`). This is conservative, because a generic question on a different
-     database is dropped too.
+   - Questions are matched after Unicode NFKC normalization, case folding, and removal of
+     punctuation, so `What’s` matches `what's`.
+5. **Remove eval overlap.** The eval splits are Spider dev, Spider test (if present) and BIRD
+   dev. Spider and BIRD are checked against each other as well as against themselves. A
+   training example is dropped if:
+   - its `db_id` matches any eval database's, in either dataset (`leak_eval_db`). For
+     example, Spider's `formula_1` is dropped because BIRD dev has a `formula_1`.
+   - its database has exactly the same table and column names as an eval database, under
+     any name (`leak_eval_schema`).
+   - its database is a near-copy of an eval database (`leak_eval_schema_similar`), meaning
+     either:
+     - the `table.column` sets have Jaccard similarity ≥ 0.6; or
+     - at least 80% of the smaller schema, and at least 4 columns, appear in the larger one.
 
-   A final assertion stops the script if any overlap is left.
-6. **Build prompts** with `data/prompt.py`. This is the one shared format for SFT, DPO,
-   baselines and serving (prompt version `v1`). It contains:
+     This catches copies that are renamed or have an extra table. `dropped.jsonl` names the
+     matching eval database and both scores.
+   - its normalized question equals any eval question (`leak_eval_question`). This is
+     conservative, because a generic question on a different database is dropped too.
+
+   After writing, the script re-reads `sft_train.jsonl` and `sft_val.jsonl` and re-runs
+   every check. If anything overlaps, it deletes the files and stops. If any eval database
+   file is missing, the run stops before starting, because the schema checks could not
+   run. `--allow-missing-eval-dbs` overrides this, and the weaker check is then recorded
+   in `stats.json`.
+6. **Build prompts** with `data.prompt.build_prompt(db_path, question, evidence)`. This is
+   the one shared format for SFT, DPO, baselines and serving (prompt version `v1`), and it
+   fixes the number of example rows, so callers cannot drift from it. It contains:
    - a system instruction;
-   - the schema as CREATE TABLE text rebuilt from PRAGMA metadata, with primary and foreign
-     keys and 3 example rows per table (values cut to 40 characters);
+   - the schema as CREATE TABLE text rebuilt from PRAGMA metadata:
+     - primary and foreign keys, with composite keys grouped;
+     - names quoted when they are SQL keywords or contain unusual characters;
+     - views with their definitions;
+     - FTS shadow tables left out;
+     - 3 example rows per table, written as SQL literals and cut to 40 characters;
    - the BIRD evidence as a `Hint:` line;
    - the question.
 
@@ -88,8 +120,10 @@ Outputs in `data/processed/`:
 
 - `sft_train.jsonl` and `sft_val.jsonl`: `{id, source, db_id, question, evidence, sql, messages}`.
 - `dropped.jsonl`: every dropped example, with its reason.
-- `stats.json`: the counts for each stage, prompt-length stats, and the settings and SHA-256
-  of every input file, for reproducibility.
+- `stats.json`: the counts for each stage, prompt-length stats, the settings, the
+  `t2s_eval` version, which eval databases were checked or missing, and the SHA-256 of
+  every input JSON file, for reproducibility. The databases themselves are not hashed,
+  because BIRD's are several GB.
 
 ## Sizes
 
@@ -102,7 +136,7 @@ published dataset sizes instead.
 | Loaded (train files) | not yet measured | not yet measured |
 | Dropped: gold SQL fails | not yet measured | not yet measured |
 | Dropped: duplicates (exact / conflicting) | not yet measured | not yet measured |
-| Dropped: eval overlap (db / schema / question) | not yet measured | not yet measured |
+| Dropped: eval overlap (db / schema / near-copy schema / question) | not yet measured | not yet measured |
 | Dropped: too long | not yet measured | not yet measured |
 | Final train / val | not yet measured | not yet measured |
 | Training databases | not yet measured | not yet measured |

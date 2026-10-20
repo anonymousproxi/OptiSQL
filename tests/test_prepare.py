@@ -17,7 +17,7 @@ def _read(path: Path) -> list[dict[str, Any]]:
 def result(raw: Path, tmp_path: Path) -> tuple[dict[str, Any], Path]:
     train, evals = default_splits(raw / "spider", raw / "bird")
     out = tmp_path / "out"
-    return run(train, evals, out, sample_rows=1, val_fraction=0.0), out
+    return run(train, evals, out, val_fraction=0.0), out
 
 
 def test_counts_and_drop_reasons(result: tuple[dict[str, Any], Path]) -> None:

@@ -20,16 +20,29 @@ import random
 import re
 import statistics
 import sys
+import unicodedata
 from collections import Counter
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import t2s_eval
 from t2s_eval import Example, execute_sql, load_examples
 
-from data.prompt import PROMPT_VERSION, build_messages
-from data.schema import schema_fingerprint, serialize_schema
+from data.prompt import PROMPT_VERSION, SCHEMA_SAMPLE_ROWS, build_prompt, clean_text
+from data.schema import (
+    schema_containment,
+    schema_fingerprint,
+    schema_items,
+    schema_similarity,
+)
+
+# A training database counts as a near-copy of an eval database when its table.column set is
+# this similar (Jaccard), or when most of the smaller schema is inside the larger one.
+SIMILARITY_THRESHOLD = 0.6
+CONTAINMENT_THRESHOLD = 0.8
+CONTAINMENT_MIN_SHARED = 4
 
 
 @dataclass(frozen=True)
@@ -59,21 +72,24 @@ class Record:
                 "messages": self.messages}
 
 
-_WS = re.compile(r"\s+")
-_TRAILING_PUNCT = re.compile(r"[\s?.!]+$")
-
-
-def clean_text(text: str) -> str:
-    return _WS.sub(" ", text).strip()
+# A quoted string or identifier ('...', "...", `...`, [...]) or a run of whitespace.
+_SQL_TOKEN = re.compile(r"""'(?:[^']|'')*'|"(?:[^"]|"")*"|`[^`]*`|\[[^\]]*\]|\s+""")
+_NON_WORD = re.compile(r"[\W_]+")
 
 
 def clean_sql(sql: str) -> str:
-    return _WS.sub(" ", sql).strip().rstrip(";").strip()
+    """Collapse whitespace outside quotes and strip a trailing semicolon. Text inside string
+    literals and quoted identifiers is left exactly as written."""
+    def fix(m: re.Match[str]) -> str:
+        return " " if m.group(0).isspace() else m.group(0)
+    return _SQL_TOKEN.sub(fix, sql).strip().rstrip(";").strip()
 
 
 def question_key(question: str) -> str:
-    """Normalized question used for duplicate and leakage matching."""
-    return _TRAILING_PUNCT.sub("", clean_text(question).lower())
+    """Normalized question for duplicate and leakage matching: Unicode NFKC, case-folded,
+    punctuation and whitespace removed (so "What’s" and "what's" match)."""
+    text = unicodedata.normalize("NFKC", question).casefold()
+    return " ".join(_NON_WORD.sub(" ", text).split())
 
 
 def default_splits(spider_dir: Path | None, bird_dir: Path | None
@@ -155,7 +171,7 @@ def dedupe(records: Iterable[Record], stats: Stats) -> list[Record]:
     kept: list[Record] = []
     for rec in records:
         q = question_key(rec.question + " " + rec.evidence)
-        exact = (rec.source, rec.db_id, q, rec.sql.lower())
+        exact = (rec.source, rec.db_id, q, rec.sql)
         if exact in seen_exact:
             stats.drop(rec, "duplicate")
             continue
@@ -172,53 +188,83 @@ def dedupe(records: Iterable[Record], stats: Stats) -> list[Record]:
 @dataclass
 class EvalIndex:
     questions: set[str]
-    db_ids: set[tuple[str, str]]
-    fingerprints: dict[str, str]  # fingerprint -> "source:db_id" of the eval database
+    db_ids: dict[str, str]  # lower-cased db_id -> "source:db_id" of the eval database
+    fingerprints: dict[str, str]  # schema fingerprint -> "source:db_id"
+    items: dict[str, frozenset[str]]  # "source:db_id" -> table.column names
     counts: dict[str, int]
+    missing_dbs: list[str]
+    # Per training database: result of closest_eval_schema (computed once, many examples).
+    near_cache: dict[Path, tuple[str, float, float] | None] = field(default_factory=dict)
 
 
 def build_eval_index(splits: Sequence[SplitFile]) -> EvalIndex:
-    questions: set[str] = set()
-    db_ids: set[tuple[str, str]] = set()
-    fingerprints: dict[str, str] = {}
-    counts: dict[str, int] = {}
+    index = EvalIndex(set(), {}, {}, {}, {}, [])
     for split in splits:
         examples = _load(split)
-        counts[f"{split.source}.{split.name}"] = len(examples)
+        index.counts[f"{split.source}.{split.name}"] = len(examples)
         for ex in examples:
-            questions.add(question_key(ex.question))
-            if (split.source, ex.db_id) not in db_ids and ex.db_path.is_file():
-                fingerprints[schema_fingerprint(ex.db_path)] = f"{split.source}:{ex.db_id}"
-            db_ids.add((split.source, ex.db_id))
-    return EvalIndex(questions, db_ids, fingerprints, counts)
+            index.questions.add(question_key(ex.question))
+            name = f"{split.source}:{ex.db_id}"
+            index.db_ids.setdefault(ex.db_id.lower(), name)
+            if name in index.items or name in index.missing_dbs:
+                continue
+            if not ex.db_path.is_file():
+                index.missing_dbs.append(name)
+                continue
+            index.items[name] = schema_items(ex.db_path)
+            index.fingerprints[schema_fingerprint(ex.db_path)] = name
+    return index
+
+
+def closest_eval_schema(db_path: Path, index: EvalIndex) -> tuple[str, float, float] | None:
+    """The eval database whose schema is a near-copy of this one, if any."""
+    if db_path in index.near_cache:
+        return index.near_cache[db_path]
+    mine = schema_items(db_path)
+    best: tuple[str, float, float] | None = None
+    for name, theirs in index.items.items():
+        jac = schema_similarity(mine, theirs)
+        con = schema_containment(mine, theirs)
+        near = jac >= SIMILARITY_THRESHOLD or (
+            con >= CONTAINMENT_THRESHOLD and len(mine & theirs) >= CONTAINMENT_MIN_SHARED)
+        if near and (best is None or jac > best[1]):
+            best = (name, jac, con)
+    index.near_cache[db_path] = best
+    return best
+
+
+def leak_reason(rec: Record, index: EvalIndex) -> tuple[str, str] | None:
+    """Why this example overlaps the eval splits, or None. Checks, in order: the same db_id
+    in any eval split (any source), the same schema under another name, a near-copy of an eval
+    schema, and the same normalized question."""
+    if rec.db_id.lower() in index.db_ids:
+        return "leak_eval_db", index.db_ids[rec.db_id.lower()]
+    if schema_fingerprint(rec.db_path) in index.fingerprints:
+        return "leak_eval_schema", index.fingerprints[schema_fingerprint(rec.db_path)]
+    near = closest_eval_schema(rec.db_path, index)
+    if near is not None:
+        return "leak_eval_schema_similar", f"{near[0]} jaccard={near[1]:.2f} contain={near[2]:.2f}"
+    if question_key(rec.question) in index.questions:
+        return "leak_eval_question", ""
+    return None
 
 
 def drop_eval_overlap(records: Iterable[Record], index: EvalIndex, stats: Stats) -> list[Record]:
-    """Drop a training example if its database is an eval database (same source and db_id, or
-    the same table/column fingerprint under any name) or its question matches any eval
-    question."""
     kept: list[Record] = []
     for rec in records:
-        if (rec.source, rec.db_id) in index.db_ids:
-            stats.drop(rec, "leak_eval_db", rec.db_id)
-            continue
-        fp = schema_fingerprint(rec.db_path)
-        if fp in index.fingerprints:
-            stats.drop(rec, "leak_eval_schema", index.fingerprints[fp])
-            continue
-        if question_key(rec.question) in index.questions:
-            stats.drop(rec, "leak_eval_question")
-            continue
-        kept.append(rec)
+        reason = leak_reason(rec, index)
+        if reason is None:
+            kept.append(rec)
+        else:
+            stats.drop(rec, *reason)
     return kept
 
 
-def attach_prompts(records: Iterable[Record], stats: Stats, sample_rows: int,
+def attach_prompts(records: Iterable[Record], stats: Stats,
                    max_prompt_chars: int) -> list[Record]:
     kept: list[Record] = []
     for rec in records:
-        schema = serialize_schema(rec.db_path, sample_rows)
-        rec.messages = build_messages(schema, rec.question, rec.evidence, answer_sql=rec.sql)
+        rec.messages = build_prompt(rec.db_path, rec.question, rec.evidence, answer_sql=rec.sql)
         prompt_chars = sum(len(m["content"]) for m in rec.messages)
         if prompt_chars > max_prompt_chars:
             stats.drop(rec, "too_long", str(prompt_chars))
@@ -263,11 +309,38 @@ def _write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+class LeakageError(RuntimeError):
+    pass
+
+
+def verify_outputs(paths: Sequence[Path], index: EvalIndex, db_paths: dict[str, Path]) -> int:
+    """Re-read the written files and re-run every overlap check on them."""
+    checked = 0
+    for path in paths:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            row = json.loads(line)
+            rec = Record(id=row["id"], source=row["source"], db_id=row["db_id"],
+                         question=row["question"], evidence=row["evidence"], sql=row["sql"],
+                         db_path=db_paths[row["id"]])
+            reason = leak_reason(rec, index)
+            if reason is not None:
+                raise LeakageError(f"{path.name}: {rec.id} overlaps eval data ({reason})")
+            checked += 1
+    return checked
+
+
 def run(train_splits: Sequence[SplitFile], eval_splits: Sequence[SplitFile], out: Path,
-        sample_rows: int = 3, max_prompt_chars: int = 16_000, val_fraction: float = 0.05,
-        seed: int = 0, skip_exec: bool = False, exec_timeout: float = 30.0) -> dict[str, Any]:
+        max_prompt_chars: int = 16_000, val_fraction: float = 0.05, seed: int = 0,
+        skip_exec: bool = False, exec_timeout: float = 30.0,
+        allow_missing_eval_dbs: bool = False) -> dict[str, Any]:
     stats = Stats()
     index = build_eval_index(eval_splits)
+    if index.missing_dbs and not allow_missing_eval_dbs:
+        raise FileNotFoundError(
+            f"{len(index.missing_dbs)} eval database files are missing, so the schema "
+            f"leakage checks cannot run: {index.missing_dbs[:5]}. Unpack them, or pass "
+            "--allow-missing-eval-dbs to accept a weaker check (recorded in stats.json)."
+        )
     records = load_train(train_splits, stats)
     if not skip_exec:
         records = drop_failing_sql(records, stats, exec_timeout)
@@ -281,19 +354,21 @@ def run(train_splits: Sequence[SplitFile], eval_splits: Sequence[SplitFile], out
         records = present
     records = dedupe(records, stats)
     records = drop_eval_overlap(records, index, stats)
-    records = attach_prompts(records, stats, sample_rows, max_prompt_chars)
+    records = attach_prompts(records, stats, max_prompt_chars)
     train, val = split_by_db(records, val_fraction, seed)
 
-    # Final guard: fail loudly if any overlap survived the filters above.
-    leaked = [r.id for r in records if question_key(r.question) in index.questions
-              or (r.source, r.db_id) in index.db_ids]
-    if leaked:
-        raise RuntimeError(f"leakage check failed for {len(leaked)} records: {leaked[:5]}")
-
     out.mkdir(parents=True, exist_ok=True)
-    _write_jsonl(out / "sft_train.jsonl", (r.to_json() for r in train))
-    _write_jsonl(out / "sft_val.jsonl", (r.to_json() for r in val))
+    outputs = [out / "sft_train.jsonl", out / "sft_val.jsonl"]
+    _write_jsonl(outputs[0], (r.to_json() for r in train))
+    _write_jsonl(outputs[1], (r.to_json() for r in val))
     _write_jsonl(out / "dropped.jsonl", stats.dropped)
+    # Final guard on what was actually written; delete the outputs if anything leaked.
+    try:
+        verified = verify_outputs(outputs, index, {r.id: r.db_path for r in records})
+    except LeakageError:
+        for path in outputs:
+            path.unlink(missing_ok=True)
+        raise
 
     per_source = {
         src: {"train": sum(r.source == src for r in train),
@@ -303,16 +378,25 @@ def run(train_splits: Sequence[SplitFile], eval_splits: Sequence[SplitFile], out
     }
     summary: dict[str, Any] = {
         "prompt_version": PROMPT_VERSION,
-        "settings": {"sample_rows": sample_rows, "max_prompt_chars": max_prompt_chars,
-                     "val_fraction": val_fraction, "seed": seed, "skip_exec": skip_exec,
-                     "exec_timeout": exec_timeout},
+        "t2s_eval_version": t2s_eval.__version__,
+        "settings": {"schema_sample_rows": SCHEMA_SAMPLE_ROWS,
+                     "max_prompt_chars": max_prompt_chars, "val_fraction": val_fraction,
+                     "seed": seed, "skip_exec": skip_exec, "exec_timeout": exec_timeout,
+                     "similarity_threshold": SIMILARITY_THRESHOLD,
+                     "containment_threshold": CONTAINMENT_THRESHOLD},
         "inputs": {f"{s.source}.{s.name}": {"path": str(s.gold), "sha256": _sha256(s.gold)}
                    for s in [*train_splits, *eval_splits]},
         "eval_examples_checked": index.counts,
         "counts": dict(sorted(stats.counts.items())),
         "output": {"train": len(train), "val": len(val), "per_source": per_source},
         "prompt_chars": _length_stats(records),
-        "leakage_check": "passed: no train/val question or database overlaps the eval splits",
+        "eval_dbs_checked": len(index.items),
+        "eval_dbs_missing": index.missing_dbs,
+        "leakage_check": (
+            f"passed on {verified} written examples: no db_id (any source), identical or "
+            "near-copy schema, or normalized question shared with the eval splits"
+            + (" (WEAKER: some eval databases were missing)" if index.missing_dbs else "")
+        ),
     }
     (out / "stats.json").write_text(json.dumps(summary, indent=2) + "\n")
     return summary
@@ -326,8 +410,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--bird-dir", type=Path, default=None,
                    help="folder with BIRD train/ and dev/ subfolders")
     p.add_argument("--out", type=Path, default=Path("data/processed"))
-    p.add_argument("--sample-rows", type=int, default=3,
-                   help="example rows per table in the schema text (0 to disable)")
     p.add_argument("--max-prompt-chars", type=int, default=16_000,
                    help="drop examples whose full chat text is longer than this")
     p.add_argument("--val-fraction", type=float, default=0.05)
@@ -335,14 +417,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--skip-exec", action="store_true",
                    help="do not execute gold SQL (faster, but keeps broken labels)")
     p.add_argument("--exec-timeout", type=float, default=30.0)
+    p.add_argument("--allow-missing-eval-dbs", action="store_true",
+                   help="continue when eval database files are missing (weaker leakage check)")
     args = p.parse_args(argv)
     if args.spider_dir is None and args.bird_dir is None:
         p.error("give --spider-dir and/or --bird-dir")
     train, evals = default_splits(args.spider_dir, args.bird_dir)
     try:
-        summary = run(train, evals, args.out, sample_rows=args.sample_rows,
-                      max_prompt_chars=args.max_prompt_chars, val_fraction=args.val_fraction,
-                      seed=args.seed, skip_exec=args.skip_exec, exec_timeout=args.exec_timeout)
+        summary = run(train, evals, args.out, max_prompt_chars=args.max_prompt_chars,
+                      val_fraction=args.val_fraction, seed=args.seed,
+                      skip_exec=args.skip_exec, exec_timeout=args.exec_timeout,
+                      allow_missing_eval_dbs=args.allow_missing_eval_dbs)
     except FileNotFoundError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

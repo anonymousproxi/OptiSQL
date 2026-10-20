@@ -7,7 +7,7 @@ from data.schema import quote_ident, schema_fingerprint, serialize_schema
 
 
 def test_serialize_schema_includes_keys(raw: Path) -> None:
-    text = serialize_schema(raw / "spider/database/concert/concert.sqlite")
+    text = serialize_schema(raw / "spider/database/concert/concert.sqlite", 0)
     assert "CREATE TABLE singer (\n  singer_id INTEGER PRIMARY KEY," in text
     assert "FOREIGN KEY (singer_id) REFERENCES singer(singer_id)" in text
     assert "Example rows" not in text
@@ -17,7 +17,7 @@ def test_serialize_schema_quotes_and_composite_keys(raw: Path) -> None:
     text = serialize_schema(raw / "spider/database/odd/odd.sqlite", 2)
     assert 'CREATE TABLE "order items"' in text
     assert 'PRIMARY KEY ("item id", qty)' in text
-    assert "-- Example rows (item id, qty):\n--   1, 2" in text
+    assert "-- Example rows (\"item id\", qty):\n--   1, 2" in text
 
 
 def test_sample_values_are_truncated(tmp_path: Path) -> None:
