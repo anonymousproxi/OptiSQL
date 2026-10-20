@@ -1,0 +1,35 @@
+# dependencies
+node_modules/
+.venv/
+__pycache__/
+*.pyc
+
+# builds
+.next/
+out/
+dist/
+build/
+
+# env and secrets
+.env
+.env.*
+!.env.example
+
+# data, models, outputs (large or licensed files stay out of git)
+data/raw/
+data/cache/
+models/
+checkpoints/
+outputs/
+wandb/
+*.safetensors
+*.gguf
+*.bin
+
+# editors and OS
+.DS_Store
+.vscode/
+.idea/
+
+# local Claude Code overrides
+.claude/settings.local.json
