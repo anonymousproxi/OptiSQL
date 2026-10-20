@@ -18,6 +18,9 @@ from typing import Any
 
 _SIMPLE_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 MAX_VALUE_CHARS = 40
+# Suffixes of the internal tables SQLite creates for FTS3/4/5 and R-tree virtual tables.
+_SHADOW_SUFFIXES = ("_data", "_idx", "_content", "_docsize", "_config", "_segments",
+                    "_segdir", "_stat", "_node", "_parent", "_rowid")
 
 # SQLite's keyword list (https://sqlite.org/lang_keywords.html). Names that collide with one
 # are quoted in the DDL so the model learns SQL that runs.
@@ -119,13 +122,20 @@ def read_tables(db_path: str | Path, sample_rows: int = 0) -> list[Table]:
                    if kind == "table" and (sql or "").upper().startswith("CREATE VIRTUAL")]
         tables: list[Table] = []
         for kind, name, sql in entries:
-            if any(name != v and name.startswith(v + "_") for v in virtual):
+            if any(name == v + suffix for v in virtual for suffix in _SHADOW_SUFFIXES):
                 continue  # FTS/R-tree shadow table
             q = always_quote(name)
-            cols = tuple(
-                Column(name=r[1], type=(r[2] or "").upper(), pk_position=int(r[5]))
-                for r in conn.execute(f"PRAGMA table_info({q})")
-            )
+            try:
+                cols = tuple(
+                    Column(name=r[1], type=(r[2] or "").upper(), pk_position=int(r[5]))
+                    for r in conn.execute(f"PRAGMA table_info({q})")
+                )
+            except sqlite3.OperationalError:
+                if kind != "view":
+                    raise
+                # A view that references a missing table cannot be described; keep its
+                # definition without columns rather than failing the whole database.
+                cols = ()
             fks = _foreign_keys(conn, name) if kind == "table" else ()
             rows: tuple[tuple[Any, ...], ...] = ()
             if sample_rows > 0 and kind == "table":
@@ -142,6 +152,8 @@ def read_tables(db_path: str | Path, sample_rows: int = 0) -> list[Table]:
 
 def table_ddl(table: Table) -> str:
     if table.view_sql is not None:
+        if not table.columns:
+            return f"{table.view_sql};\n-- View is broken (references a missing object)"
         cols = ", ".join(quote_ident(c.name) for c in table.columns)
         return f"{table.view_sql};\n-- View columns: {cols}"
     parts: list[str] = []

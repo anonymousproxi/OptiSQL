@@ -145,3 +145,31 @@ def test_fts_shadow_tables_skipped_and_views_included(tmp_path: Path) -> None:
     assert "CREATE TABLE f (" in text
     assert "f_data" not in text and "f_idx" not in text and "f_content" not in text
     assert "CREATE VIEW long_docs AS SELECT id FROM doc WHERE length(body) > 10;" in text
+
+
+def test_regular_table_with_virtual_prefix_is_kept(tmp_path: Path) -> None:
+    db = tmp_path / "p.sqlite"
+    conn = sqlite3.connect(db)
+    conn.executescript("""
+        CREATE VIRTUAL TABLE f USING fts5(body);
+        CREATE TABLE f_notes (id INT, note TEXT);
+    """)
+    conn.close()
+    text = serialize_schema(db, 0)
+    assert "CREATE TABLE f_notes (" in text
+    assert "f_data" not in text and "f_config" not in text
+
+
+def test_broken_view_does_not_stop_the_run(tmp_path: Path) -> None:
+    db = tmp_path / "bv.sqlite"
+    conn = sqlite3.connect(db)
+    conn.executescript("""
+        CREATE TABLE t (a INT);
+        CREATE VIEW v AS SELECT a FROM t;
+        DROP TABLE t;
+        CREATE TABLE u (b INT);
+    """)
+    conn.close()
+    text = serialize_schema(db, 1)
+    assert "CREATE TABLE u (" in text
+    assert "-- View is broken" in text
