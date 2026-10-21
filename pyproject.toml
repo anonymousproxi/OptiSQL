@@ -5,6 +5,7 @@ pythonpath = ["."]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+extend-exclude = ["notebooks"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP"]
@@ -13,4 +14,10 @@ select = ["E", "F", "I", "B", "UP"]
 strict = true
 python_version = "3.11"
 # t2s_eval is an editable install from the sibling repo; point mypy at its source.
-mypy_path = "../text2sql/eval"
+mypy_path = "../EvalSQL/eval"
+
+# Heavy training libraries are not type-checked; their stubs need a newer Python than 3.11.
+[[tool.mypy.overrides]]
+module = ["torch.*", "transformers.*", "trl.*", "peft.*", "datasets.*", "unsloth.*", "numpy.*"]
+ignore_missing_imports = true
+follow_imports = "skip"

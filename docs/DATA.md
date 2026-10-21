@@ -26,8 +26,8 @@ What this means for the project:
 The build environment cannot reach the dataset hosts, so you download and unpack these
 yourself. Paths are relative to `sql-finetune/`.
 
-Requirements: Python 3.11 or newer, and the `text2sql` repo cloned next to this one
-(`../text2sql`), because `requirements-data.txt` installs `t2s_eval` from there.
+Requirements: Python 3.11 or newer, and the `EvalSQL` repo cloned next to this one
+(`../EvalSQL`), because `requirements-data.txt` installs `t2s_eval` from there.
 
 1. **Spider.** From https://yale-lily.github.io/spider, download the Spider dataset zip and
    unpack it so these paths exist. Newer zips unpack to a `spider_data/` folder; rename it
@@ -51,7 +51,7 @@ Requirements: Python 3.11 or newer, and the `text2sql` repo cloned next to this 
 3. Run the pipeline:
    ```bash
    python -m venv .venv && source .venv/bin/activate
-   pip install -r requirements-data.txt        # installs ../text2sql/eval (t2s_eval)
+   pip install -r requirements-data.txt        # installs ../EvalSQL/eval (t2s_eval)
    python -m data.prepare --spider-dir data/raw/spider --bird-dir data/raw/bird --out data/processed
    ```
    Executing every BIRD gold query can take several minutes, because some BIRD databases

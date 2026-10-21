@@ -1,0 +1,12 @@
+# Ablation: LoRA rank 32. Only lora_r and run_name differ from sft_r16.toml.
+run_name = "sft_r32"
+model_name = "Qwen/Qwen2.5-Coder-7B-Instruct"
+backend = "unsloth"
+load_in_4bit = true
+
+max_seq_length = 4096
+lora_r = 32
+learning_rate = 2e-4
+num_train_epochs = 2.0
+per_device_train_batch_size = 2
+gradient_accumulation_steps = 8   # effective batch 16

@@ -1,0 +1,7 @@
+# GPU runs through Unsloth (Colab, Kaggle, rented GPU).
+#
+# NOT YET RUN. unsloth decides which trl, transformers and peft versions it works with, so only
+# unsloth itself is pinned here. Every run records the versions pip resolved in
+# outputs/<run>/run_meta.json. After the first successful GPU run, copy the versions from there
+# into this file so later runs and the model card are reproducible.
+unsloth==2026.10.7

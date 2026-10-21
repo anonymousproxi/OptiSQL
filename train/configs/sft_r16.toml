@@ -1,0 +1,12 @@
+# Main SFT run. The ablation configs (r8, r32, lr) differ from this file in the lines noted.
+run_name = "sft_r16"
+model_name = "Qwen/Qwen2.5-Coder-7B-Instruct"
+backend = "unsloth"
+load_in_4bit = true
+
+max_seq_length = 4096
+lora_r = 16            # lora_alpha defaults to 2 * lora_r
+learning_rate = 2e-4
+num_train_epochs = 2.0
+per_device_train_batch_size = 2
+gradient_accumulation_steps = 8   # effective batch 16

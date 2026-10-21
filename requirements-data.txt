@@ -1,5 +1,5 @@
 # M1 data preparation: standard library only, plus the shared scorer from the sibling repo.
--e ../text2sql/eval
+-e ../EvalSQL/eval
 pytest==8.3.3
 ruff==0.7.4
 mypy==1.13.0
